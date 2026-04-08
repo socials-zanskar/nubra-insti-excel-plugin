@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nubra Insti Login</title>
+    <link rel="stylesheet" href="./taskpane.css" />
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  </head>
+  <body>
+    <main class="container">
+      <section class="hero">
+        <div class="brand-row">
+          <img src="./icons/nubra.png" alt="Nubra" class="brand-logo" />
+          <div>
+            <h1>Nubra Insti Login</h1>
+            <p class="subtitle">Excel add-in shell with icon parity and Insti auth only.</p>
+          </div>
+        </div>
+        <div class="meta-row">
+          <span id="authBadge" class="badge bad">Not logged in</span>
+          <span class="device-chip">Device: <code id="deviceIdText">-</code></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>Institutional Credentials</h2>
+          <button id="clearSessionButton" type="button" class="secondary">Logout</button>
+        </div>
+
+        <div class="grid">
+          <label for="exchangeClientCodeInput">Exchange Client Code</label>
+          <input id="exchangeClientCodeInput" type="text" placeholder="OWN" />
+
+          <label for="clientCodeInput">Client Code</label>
+          <input id="clientCodeInput" type="text" placeholder="OWN-M2" />
+
+          <label for="usernameInput">Username</label>
+          <input id="usernameInput" type="text" placeholder="OWN-M2" />
+
+          <label for="passwordInput">Password</label>
+          <input id="passwordInput" type="password" placeholder="Password" />
+
+          <button id="loginInstiButton" type="button">1) Login Insti</button>
+        </div>
+
+        <div id="mpinStage" class="grid top-gap hidden">
+          <label for="pinInput">MPIN</label>
+          <input id="pinInput" type="password" placeholder="4-digit MPIN" maxlength="4" />
+          <button id="verifyPinButton" type="button">2) Verify MPIN</button>
+        </div>
+
+        <div id="actionMessage" class="message hidden" aria-live="polite"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>Dashboard</h2>
+        </div>
+        <div class="grid">
+          <button id="syncInstrumentsButton" type="button" class="secondary">Load F&O Stocks Cache</button>
+          <p class="subtitle">Fetches only stocks that have futures into the local backend cache for dashboard search.</p>
+        </div>
+        <div class="grid top-gap">
+          <label for="trackerInstrumentInput">Track Stock</label>
+          <div class="combo">
+            <input id="trackerInstrumentInput" type="text" autocomplete="off" placeholder="Type stock name or underlying" />
+            <div id="instrumentDropdown" class="combo-menu hidden" role="listbox" aria-label="Instrument suggestions"></div>
+          </div>
+          <button id="addTrackerInstrumentButton" type="button">Add To Live Tracker</button>
+          <p class="subtitle">Searches only stocks that have futures and adds stock plus current and next future live data to the tracker sheet.</p>
+        </div>
+        <div class="grid top-gap">
+          <label for="intervalStartInput">Interval Tracker</label>
+          <input id="intervalStartInput" type="time" value="09:15" />
+          <input id="intervalEndInput" type="time" value="15:30" />
+          <input id="intervalMinutesInput" type="number" min="1" step="1" value="15" placeholder="Minutes" />
+          <button id="createIntervalSheetButton" type="button" class="secondary">Create Interval Sheet</button>
+          <select id="intervalSlotSelect"></select>
+          <button id="captureIntervalButton" type="button">Refresh Latest Interval</button>
+          <p class="subtitle">Builds past intervals from historical intraday data and refreshes the latest open interval from live data.</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Session</h2>
+        <div class="kv">
+          <span>Auth Token</span>
+          <code id="authTokenText">-</code>
+        </div>
+        <div class="kv">
+          <span>Session Token</span>
+          <code id="sessionTokenText">-</code>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Status Log</h2>
+        <pre id="statusLog">Ready.</pre>
+      </section>
+    </main>
+
+    <script src="./taskpane.js"></script>
+  </body>
+  </html>

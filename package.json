@@ -1,0 +1,17 @@
+{
+  "name": "nubra-insti-excel-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "powershell -ExecutionPolicy Bypass -File \"./setup-local.ps1\"",
+    "start": "powershell -ExecutionPolicy Bypass -File \"./start-all.ps1\"",
+    "stop": "powershell -ExecutionPolicy Bypass -File \"./stop-all.ps1\"",
+    "build:launcher": "powershell -ExecutionPolicy Bypass -File \"./build-launcher.ps1\""
+  },
+  "devDependencies": {
+    "office-addin-debugging": "^6.0.6",
+    "office-addin-dev-certs": "^2.0.6",
+    "office-addin-dev-settings": "^3.0.6"
+  }
+}
