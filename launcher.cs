@@ -42,6 +42,23 @@ internal static class Program
         return "node";
     }
 
+    private static string ResolveNpmCmd(string baseDir)
+    {
+        var runtimeNpm = Path.Combine(baseDir, "runtime", "node", "npm.cmd");
+        if (File.Exists(runtimeNpm))
+        {
+            return runtimeNpm;
+        }
+
+        var programFilesNpm = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "nodejs", "npm.cmd");
+        if (File.Exists(programFilesNpm))
+        {
+            return programFilesNpm;
+        }
+
+        return "npm.cmd";
+    }
+
     private static void RequireFile(string path, string helpText)
     {
         if (!File.Exists(path))
@@ -193,6 +210,37 @@ internal static class Program
         );
     }
 
+    private static void EnsureNodeDependencies(string baseDir, string logPath)
+    {
+        var packageJsonPath = Path.Combine(baseDir, "package.json");
+        var packageLockPath = Path.Combine(baseDir, "package-lock.json");
+        var devSettingsCli = Path.Combine(baseDir, "node_modules", "office-addin-dev-settings", "cli.js");
+        if (File.Exists(devSettingsCli))
+        {
+            AppendLog(logPath, "Node dependencies already installed.");
+            return;
+        }
+
+        RequireFile(packageJsonPath, "Keep package.json in the same folder as NubraInstiExcelLauncher.exe.");
+        Console.WriteLine("[launcher] Installing first-run dependencies. This may take a few minutes...");
+        AppendLog(logPath, "Installing Node dependencies.");
+
+        var npmCmd = ResolveNpmCmd(baseDir);
+        var npmArgs = File.Exists(packageLockPath) ? "ci --omit=optional" : "install --omit=optional";
+        var exitCode = RunProcess(npmCmd, npmArgs, baseDir, logPath, true, false);
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException(
+                "Dependency install failed. Check your internet connection, install Node.js, then run setup-local.ps1 once."
+            );
+        }
+
+        RequireFile(
+            devSettingsCli,
+            "Dependency install completed, but the Office add-in CLI was still not found. Delete node_modules and run setup-local.ps1 once."
+        );
+    }
+
     private static void RunNodeCli(string nodeExe, string cliScript, string arguments, string baseDir, string logPath)
     {
         RequireFile(
@@ -225,6 +273,7 @@ internal static class Program
             Console.WriteLine("[launcher] Starting Nubra Insti Excel Plugin...");
             Console.WriteLine("[launcher] Folder: " + baseDir);
 
+            EnsureNodeDependencies(baseDir, logPath);
             EnsureServerRunning(nodeExe, baseDir, logPath);
             RunNodeCli(nodeExe, devSettingsCli, "register \"" + manifestPath + "\"", baseDir, logPath);
             RunNodeCli(nodeExe, devSettingsCli, "sideload \"" + manifestPath + "\" desktop --app excel", baseDir, logPath);

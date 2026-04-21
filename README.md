@@ -16,7 +16,7 @@ This Excel plugin is built for Nubra's institutional clients to log in, add inst
 1. Download this project folder to your Windows machine.
 2. Keep all files together in the same folder. Do not move the `.exe` file away from the other project files.
 3. Double-click `NubraInstiExcelLauncher.exe`.
-4. Wait for the launcher to start the local Nubra Excel plugin services.
+4. Wait for the launcher to start the local Nubra Excel plugin services. On first launch, it may install required Office add-in dependencies automatically.
 5. Open Microsoft Excel.
 6. Open the Nubra Excel add-in/task pane when prompted by the launcher setup.
 
@@ -47,3 +47,4 @@ This Excel plugin is built for Nubra's institutional clients to log in, add inst
 - You must have valid Nubra Insti login credentials and MPIN access.
 - The launcher and supporting files should remain in the same folder for the setup to work correctly.
 - Excel desktop on Windows is recommended.
+- If first launch cannot install dependencies because of network or machine policy, run `setup-local.ps1` once from PowerShell, then launch the `.exe` again.
