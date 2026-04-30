@@ -14,21 +14,51 @@
   let activeSuggestionIndex = -1;
   let searchTimer = null;
   let searchResults = [];
+  let pendingHistoricalRefreshTimer = null;
+  let pendingHistoricalRefreshIndex = -1;
+  const ROLLOVER_HISTORICAL_REFRESH_DELAY_MS = 10_000;
 
-  function loadIntervalState() {
-    return getJsonStorage(STORAGE.intervalState, {
+  function emptyIntervalState() {
+    return {
       intervals: [],
       rows: [],
       captures: {},
-    });
+      latestIntervalIndex: -1,
+    };
+  }
+
+  function loadIntervalState() {
+    return getJsonStorage(STORAGE.intervalState, emptyIntervalState());
   }
 
   function saveIntervalState(state) {
-    setJsonStorage(STORAGE.intervalState, state || {
-      intervals: [],
-      rows: [],
-      captures: {},
-    });
+    setJsonStorage(STORAGE.intervalState, state || emptyIntervalState());
+  }
+
+  function clearPendingHistoricalRefresh() {
+    if (pendingHistoricalRefreshTimer) {
+      clearTimeout(pendingHistoricalRefreshTimer);
+      pendingHistoricalRefreshTimer = null;
+    }
+    pendingHistoricalRefreshIndex = -1;
+  }
+
+  function scheduleHistoricalRefreshAfterRollover(nextIntervalIndex, options = {}) {
+    const targetIndex = Number(nextIntervalIndex);
+    if (!Number.isInteger(targetIndex) || targetIndex < 0) return;
+    if (pendingHistoricalRefreshTimer && pendingHistoricalRefreshIndex === targetIndex) return;
+
+    clearPendingHistoricalRefresh();
+    pendingHistoricalRefreshIndex = targetIndex;
+    pendingHistoricalRefreshTimer = window.setTimeout(() => {
+      pendingHistoricalRefreshTimer = null;
+      const scheduledIndex = pendingHistoricalRefreshIndex;
+      pendingHistoricalRefreshIndex = -1;
+      refreshIntervalSheet({ silent: options.silent }).catch((error) => {
+        const message = error?.message || String(error);
+        log(`Delayed interval refresh failed for interval ${scheduledIndex + 1}: ${message}`, true);
+      });
+    }, ROLLOVER_HISTORICAL_REFRESH_DELAY_MS);
   }
 
   function now() {
@@ -181,6 +211,11 @@
     return Number.isFinite(n) ? Number((n / 100).toFixed(2)) : "";
   }
 
+  function toFiniteNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
   function asDisplayTime(value) {
     const raw = clean(value);
     if (!raw) return "";
@@ -238,6 +273,24 @@
       });
     }
     return intervals;
+  }
+
+  function currentIstMinutes() {
+    const parts = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date());
+    const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return Number(lookup.hour || 0) * 60 + Number(lookup.minute || 0);
+  }
+
+  function resolveCurrentIntervalIndex(intervals) {
+    const items = Array.isArray(intervals) ? intervals : [];
+    if (!items.length) return -1;
+    const nowMinutes = currentIstMinutes();
+    return items.findIndex((interval) => nowMinutes >= Number(interval.start) && nowMinutes < Number(interval.end));
   }
 
   function intervalMetricFields() {
@@ -448,6 +501,7 @@
     setMessage("Login successful. Session token stored.", "good");
     log("`verifypin` succeeded. Session token stored.");
     refreshUi();
+    syncTrackerPoller();
   }
 
   async function writeLiveTrackerSheet(trackedItems) {
@@ -559,32 +613,39 @@
     });
   }
 
-  function computeIntervalMetrics(snapshot, prevCapture) {
-    const stockLtp = Number(snapshot?.stock?.curr_ltp);
-    const futureLtp = Number(snapshot?.current_future?.curr_ltp);
-    const futurePrevClose = Number(snapshot?.current_future?.prev_close);
-    const futureOi = Number(snapshot?.current_future?.oi_current);
-    const previousIntervalOi = Number(prevCapture?.current_future?.oi_current);
-    const futurePrevOi = Number(snapshot?.current_future?.oi_yest_close);
-    const prevStockLtp = Number(prevCapture?.stock?.curr_ltp);
-    const prevFutureLtp = Number(prevCapture?.current_future?.curr_ltp);
-    const basis = Number.isFinite(futureLtp) && Number.isFinite(stockLtp) ? futureLtp - stockLtp : "";
+  function computeIntervalMetrics(snapshot, prevCapture, allowSessionOiFallback = false) {
+    const stockLtp = toFiniteNumber(snapshot?.stock?.curr_ltp);
+    const futureLtp = toFiniteNumber(snapshot?.current_future?.curr_ltp);
+    const futurePrevClose = toFiniteNumber(snapshot?.current_future?.prev_close);
+    const futureOi = toFiniteNumber(snapshot?.current_future?.oi_current);
+    const previousIntervalOi = toFiniteNumber(prevCapture?.current_future?.oi_current);
+    const futurePrevOi = toFiniteNumber(snapshot?.current_future?.oi_yest_close);
+    const prevStockLtp = toFiniteNumber(prevCapture?.stock?.curr_ltp);
+    const prevFutureLtp = toFiniteNumber(prevCapture?.current_future?.curr_ltp);
+    const basisValue = Number.isFinite(futureLtp) && Number.isFinite(stockLtp) ? futureLtp - stockLtp : null;
     const prevBasisValue = Number.isFinite(prevFutureLtp) && Number.isFinite(prevStockLtp)
       ? prevFutureLtp - prevStockLtp
       : null;
-    const oiBaseValue = Number.isFinite(previousIntervalOi) ? previousIntervalOi : (Number.isFinite(futurePrevOi) ? futurePrevOi : null);
+    const oiBaseValue = Number.isFinite(previousIntervalOi)
+      ? previousIntervalOi
+      : (allowSessionOiFallback && Number.isFinite(futurePrevOi) ? futurePrevOi : null);
+    const useLiveWebsocketOi = clean(snapshot?.current_future?.quote_source).toLowerCase() === "websocket:index";
     const prevBasis = Number.isFinite(prevBasisValue) ? prevBasisValue : "";
     return {
       last_price: Number.isFinite(futureLtp) ? futureLtp : "",
       rt_px_chg_pct_1d: Number.isFinite(futureLtp) && Number.isFinite(futurePrevClose) && futurePrevClose !== 0
         ? ((futureLtp - futurePrevClose) / futurePrevClose) * 100
         : "",
-      oi_chng: Number.isFinite(futureOi) && Number.isFinite(oiBaseValue) ? futureOi - oiBaseValue : "",
-      oi_pct: Number.isFinite(futureOi) && Number.isFinite(oiBaseValue) && oiBaseValue !== 0
+      oi_chng: useLiveWebsocketOi
+        ? (Number.isFinite(futureOi) ? futureOi : "")
+        : (Number.isFinite(futureOi) && Number.isFinite(oiBaseValue) ? futureOi - oiBaseValue : ""),
+      oi_pct: useLiveWebsocketOi
+        ? ""
+        : (Number.isFinite(futureOi) && Number.isFinite(oiBaseValue) && oiBaseValue !== 0
         ? ((futureOi - oiBaseValue) / oiBaseValue) * 100
-        : "",
-      basis,
-      basis_change: Number.isFinite(Number(basis)) && Number.isFinite(prevBasisValue) ? Number(basis) - prevBasisValue : "",
+        : ""),
+      basis: Number.isFinite(basisValue) ? basisValue : "",
+      basis_change: Number.isFinite(basisValue) && Number.isFinite(prevBasisValue) ? basisValue - prevBasisValue : "",
       prev_basis: prevBasis,
     };
   }
@@ -597,7 +658,49 @@
     return map;
   }
 
-  async function writeIntervalTrackerSheet(state) {
+  function buildLiveIntervalSnapshot(item) {
+    const underlying = clean(item?.underlying || item?.symbol);
+    if (!underlying) return null;
+    return {
+      underlying,
+      display: item?.display || underlying,
+      stock: item?.stock ? {
+        symbol: item.stock.symbol || underlying,
+        ref_id: item.stock.ref_id ?? null,
+        prev_close: item.stock.prev_close ?? null,
+        curr_ltp: item.stock.curr_ltp ?? null,
+        ltp_as_of: item.stock.ltp_as_of || item.updated_at || "",
+        quote_source: item.stock.quote_source || "",
+      } : null,
+      current_future: item?.current_future ? {
+        symbol: item.current_future.symbol || "",
+        expiry: item.current_future.expiry || "",
+        ref_id: item.current_future.ref_id ?? null,
+        prev_close: item.current_future.prev_close ?? null,
+        curr_ltp: item.current_future.curr_ltp ?? null,
+        ltp_as_of: item.current_future.ltp_as_of || item.updated_at || "",
+        oi_yest_close: item.current_future.oi_yest_close ?? null,
+        oi_current: item.current_future.oi_current ?? null,
+        oi_as_of: item.current_future.oi_as_of || item.updated_at || "",
+        quote_source: item.current_future.quote_source || "",
+      } : null,
+      next_future: item?.next_future ? {
+        symbol: item.next_future.symbol || "",
+        expiry: item.next_future.expiry || "",
+        ref_id: item.next_future.ref_id ?? null,
+        prev_close: item.next_future.prev_close ?? null,
+        curr_ltp: item.next_future.curr_ltp ?? null,
+        ltp_as_of: item.next_future.ltp_as_of || item.updated_at || "",
+        oi_yest_close: item.next_future.oi_yest_close ?? null,
+        oi_current: item.next_future.oi_current ?? null,
+        oi_as_of: item.next_future.oi_as_of || item.updated_at || "",
+        quote_source: item.next_future.quote_source || "",
+      } : null,
+      updated_at: item?.updated_at || new Date().toISOString(),
+    };
+  }
+
+  async function writeIntervalTrackerSheet(state, options = {}) {
     if (typeof Excel === "undefined") {
       throw new Error("Excel host is not available.");
     }
@@ -642,7 +745,7 @@
       for (const interval of intervals) {
         const snapshot = captures?.[String(interval.index)]?.[row.underlying] || null;
         const prevSnapshot = interval.index > 0 ? captures?.[String(interval.index - 1)]?.[row.underlying] || null : null;
-        const intervalMetrics = snapshot ? computeIntervalMetrics(snapshot, prevSnapshot) : {};
+        const intervalMetrics = snapshot ? computeIntervalMetrics(snapshot, prevSnapshot, interval.index === 0) : {};
         const stockPrevClose = snapshot?.stock?.prev_close;
         const stockCurrLtp = snapshot?.stock?.curr_ltp;
         const futurePrevClose = snapshot?.current_future?.prev_close;
@@ -679,11 +782,12 @@
       await context.sync();
       const expectedRows = values.length;
       const expectedCols = values[0].length;
+      const forceFullRewrite = Boolean(options?.forceFullRewrite);
       const sameShape = !usedRange.isNullObject
         && Number(usedRange.rowCount || 0) === expectedRows
         && Number(usedRange.columnCount || 0) === expectedCols;
 
-      if (!sameShape) {
+      if (forceFullRewrite || !sameShape) {
         if (!usedRange.isNullObject) {
           usedRange.clear();
         }
@@ -781,6 +885,17 @@
     return data || null;
   }
 
+  function rowsFromIntervalItems(items) {
+    return (Array.isArray(items) ? items : []).map((item) => ({
+      underlying: item.underlying || "",
+      display: item.display || "",
+      stock_symbol: item.stock?.symbol || item.underlying || "",
+      front_future_symbol: item.futures?.[0]?.symbol || "",
+      future_1: item.futures?.[0]?.symbol || "",
+      future_2: item.futures?.[1]?.symbol || "",
+    }));
+  }
+
   async function handleCreateIntervalSheet() {
     const sessionToken = getStorage(STORAGE.session, "");
     if (!sessionToken) {
@@ -821,14 +936,7 @@
       throw new Error("No selected LiveTracker stocks are available in cache.");
     }
 
-    const rows = items.map((item) => ({
-      underlying: item.underlying || "",
-      display: item.display || "",
-      stock_symbol: item.stock?.symbol || item.underlying || "",
-      front_future_symbol: item.futures?.[0]?.symbol || "",
-      future_1: item.futures?.[0]?.symbol || "",
-      future_2: item.futures?.[1]?.symbol || "",
-    }));
+    const rows = rowsFromIntervalItems(items);
 
     const state = {
       intervals,
@@ -838,7 +946,7 @@
     };
     saveIntervalState(state);
     populateIntervalSlotSelect(intervals, Math.max(0, state.latestIntervalIndex));
-    await writeIntervalTrackerSheet(state);
+    await writeIntervalTrackerSheet(state, { forceFullRewrite: true });
     setMessage(`IntervalTracker built with ${rows.length} stocks and ${intervals.length} intervals.`, "good");
     log(`Built IntervalTracker with ${rows.length} stocks and ${intervals.length} intervals using historical + live data.`);
   }
@@ -876,19 +984,23 @@
         underlyings,
       },
     });
+    const rows = rowsFromIntervalItems(data?.items);
     const nextState = {
       ...state,
+      rows: rows.length ? rows : state?.rows || [],
       captures: data?.snapshots || state?.captures || {},
       latestIntervalIndex: Number.isInteger(Number(data?.latest_interval_index)) ? Number(data.latest_interval_index) : state?.latestIntervalIndex ?? -1,
     };
     saveIntervalState(nextState);
     populateIntervalSlotSelect(intervals, Math.max(0, nextState.latestIntervalIndex));
-    await writeIntervalTrackerSheet(nextState);
+    await writeIntervalTrackerSheet(nextState, { forceFullRewrite: true });
     setMessage(`Interval sheet refreshed for ${Number(data?.count || 0)} stocks.`, "good");
     log(`Refreshed interval sheet for ${Number(data?.count || 0)} stocks.`);
   }
 
   async function refreshIntervalSheet(options = {}) {
+    clearPendingHistoricalRefresh();
+
     const sessionToken = getStorage(STORAGE.session, "");
     if (!sessionToken) return;
 
@@ -915,27 +1027,97 @@
         underlyings,
       },
     });
+    const rows = rowsFromIntervalItems(data?.items);
 
     const nextState = {
       ...state,
+      rows: rows.length ? rows : state?.rows || [],
       captures: data?.snapshots || state?.captures || {},
       latestIntervalIndex: Number.isInteger(Number(data?.latest_interval_index)) ? Number(data.latest_interval_index) : state?.latestIntervalIndex ?? -1,
     };
     saveIntervalState(nextState);
     populateIntervalSlotSelect(intervals, Math.max(0, nextState.latestIntervalIndex));
-    await writeIntervalTrackerSheet(nextState);
+    await writeIntervalTrackerSheet(nextState, { forceFullRewrite: true });
     if (!options.silent) {
       setMessage(`Interval sheet refreshed for ${Number(data?.count || 0)} stocks.`, "good");
       log(`Refreshed interval sheet for ${Number(data?.count || 0)} stocks.`);
     }
   }
 
-  async function refreshTrackedQuotes(options = {}) {
+  async function syncIntervalSheetWithLiveData(trackedItems, options = {}) {
     const sessionToken = getStorage(STORAGE.session, "");
     if (!sessionToken) return;
 
+    const state = loadIntervalState();
+    const intervals = Array.isArray(state?.intervals) ? state.intervals : [];
+    if (!intervals.length) return;
+
+    const currentIntervalIndex = resolveCurrentIntervalIndex(intervals);
+    const previousIntervalIndex = Number.isInteger(Number(state?.latestIntervalIndex))
+      ? Number(state.latestIntervalIndex)
+      : -1;
+    const rolloverDetected = currentIntervalIndex !== previousIntervalIndex;
+
+    if (rolloverDetected && currentIntervalIndex < 0) {
+      const nextState = {
+        ...state,
+        latestIntervalIndex: -1,
+      };
+      saveIntervalState(nextState);
+      return;
+    }
+
+    if (rolloverDetected) {
+      scheduleHistoricalRefreshAfterRollover(currentIntervalIndex, { silent: options.silent });
+      if (!options.silent) {
+        setMessage("New interval started. Historical data will refresh in 10 seconds.", "good");
+        log(`Interval rolled over to ${currentIntervalIndex + 1}. Scheduled delayed historical refresh.`);
+      }
+    }
+    if (currentIntervalIndex < 0) return;
+
+    const liveRows = Array.isArray(trackedItems) ? trackedItems : trackedInstruments();
+    if (!liveRows.length) return;
+
+    const trackedMap = rowMapByUnderlying(liveRows);
+    const captureKey = String(currentIntervalIndex);
+    const nextCaptures = {
+      ...(state?.captures || {}),
+      [captureKey]: {
+        ...((state?.captures || {})[captureKey] || {}),
+      },
+    };
+
+    for (const row of Array.isArray(state?.rows) ? state.rows : []) {
+      const tracked = trackedMap.get(clean(row?.underlying).toUpperCase());
+      if (!tracked) continue;
+      const snapshot = buildLiveIntervalSnapshot(tracked);
+      if (snapshot) {
+        nextCaptures[captureKey][row.underlying] = snapshot;
+      }
+    }
+
+    const nextState = {
+      ...state,
+      captures: nextCaptures,
+      latestIntervalIndex: currentIntervalIndex,
+    };
+    saveIntervalState(nextState);
+    populateIntervalSlotSelect(intervals, Math.max(0, currentIntervalIndex));
+    await writeIntervalTrackerSheet(nextState);
+
+    if (!options.silent) {
+      setMessage("Live interval updated from websocket-backed quotes.", "good");
+      log(`Updated open interval ${currentIntervalIndex + 1} with live data.`);
+    }
+  }
+
+  async function refreshTrackedQuotes(options = {}) {
+    const sessionToken = getStorage(STORAGE.session, "");
+    if (!sessionToken) return [];
+
     const current = trackedInstruments();
-    if (!current.length) return;
+    if (!current.length) return [];
 
     const next = await Promise.all(current.map(async (item) => {
       try {
@@ -966,6 +1148,7 @@
     if (!options.silent) {
       setMessage(`LiveTracker updated for ${next.length} instrument${next.length === 1 ? "" : "s"}.`, "good");
     }
+    return next;
   }
 
   function stopTrackerPoller() {
@@ -980,7 +1163,7 @@
     if (!getStorage(STORAGE.session, "") || !trackedInstruments().length) return;
     trackerTimer = setInterval(() => {
       refreshTrackedQuotes({ silent: true })
-        .then(() => refreshIntervalSheet({ silent: true }))
+        .then((next) => syncIntervalSheetWithLiveData(next, { silent: true }))
         .catch(() => null);
     }, 3000);
   }
@@ -1010,7 +1193,9 @@
         }]);
 
     saveTrackedInstruments(next);
-    await refreshTrackedQuotes({ silent: true });
+    const refreshed = await refreshTrackedQuotes({ silent: true });
+    await refreshIntervalSheet({ silent: true }).catch(() => null);
+    await syncIntervalSheetWithLiveData(refreshed, { silent: true }).catch(() => null);
     syncTrackerPoller();
     U.trackerInstrumentInput.value = underlying;
     setMessage(`Added ${underlying} to LiveTracker.`, "good");
@@ -1033,10 +1218,12 @@
     });
 
     await removeObsoleteSheets();
+    clearPendingHistoricalRefresh();
     saveTrackedInstruments([]);
     await writeLiveTrackerSheet([]);
-    saveIntervalState({ intervals: [], rows: [], captures: {} });
+    saveIntervalState(emptyIntervalState());
     populateIntervalSlotSelect([], 0);
+    syncTrackerPoller();
     searchResults = [];
     hideInstrumentDropdown();
     setMessage(`Backend F&O stocks cache loaded with ${Number(data?.stocks_with_futures || 0)} stocks.`, "good");
@@ -1044,12 +1231,14 @@
   }
 
   function clearSession() {
+    clearPendingHistoricalRefresh();
     delStorage(STORAGE.auth);
     delStorage(STORAGE.session);
     U.pinInput.value = "";
     setMessage("Stored auth state cleared.", "good");
     log("Cleared local auth/session tokens.");
     refreshUi();
+    syncTrackerPoller();
   }
 
   function bind() {
@@ -1188,7 +1377,11 @@
 
   function init() {
     bind();
-    populateIntervalSlotSelect(loadIntervalState()?.intervals || [], 0);
+    const state = loadIntervalState();
+    const latestIntervalIndex = Number.isInteger(Number(state?.latestIntervalIndex))
+      ? Number(state.latestIntervalIndex)
+      : 0;
+    populateIntervalSlotSelect(state?.intervals || [], Math.max(0, latestIntervalIndex));
     refreshUi();
     syncTrackerPoller();
     log("Insti login task pane initialized.");
@@ -1196,6 +1389,7 @@
 
   window.addEventListener("beforeunload", () => {
     clearSearchTimer();
+    clearPendingHistoricalRefresh();
     stopTrackerPoller();
   });
 

@@ -41,6 +41,24 @@ const futureStockCache = {
   date: "",
   items: [],
 };
+const REALTIME_STALE_MS = Math.max(1_000, Number(process.env.NUBRA_REALTIME_STALE_MS || 15_000));
+const REALTIME_RECONNECT_MS = Math.max(1_000, Number(process.env.NUBRA_REALTIME_RECONNECT_MS || 2_000));
+const INDEX_SOCKET_INTERVAL = String(process.env.NUBRA_WS_INDEX_INTERVAL || "").trim();
+const textDecoder = new TextDecoder();
+const realtimeSocketState = {
+  sessionToken: "",
+  deviceId: "",
+  socket: null,
+  status: "idle",
+  desiredByExchange: new Map(),
+  subscribedByExchange: new Map(),
+  cache: new Map(),
+  reconnectTimer: null,
+  connectedAt: "",
+  lastMessageAt: "",
+  messageCount: 0,
+  lastError: "",
+};
 
 function normalizeOrigin(value) {
   const raw = String(value || "").trim();
@@ -547,6 +565,577 @@ function timestampToIso(value) {
   return Number.isNaN(parsed) ? "" : new Date(parsed).toISOString();
 }
 
+function websocketOrigin() {
+  const url = new URL(PROXY_ORIGIN);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/apibatch/ws";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function normalizeExchange(value, fallback = "NSE") {
+  return upper(value || fallback || "NSE");
+}
+
+function ensureMapSet(map, key) {
+  const probe = normalizeExchange(key);
+  const current = map.get(probe);
+  if (current) return current;
+  const created = new Set();
+  map.set(probe, created);
+  return created;
+}
+
+function desiredRealtimeSymbolCount() {
+  let total = 0;
+  for (const values of realtimeSocketState.desiredByExchange.values()) {
+    total += values.size;
+  }
+  return total;
+}
+
+function clearRealtimeReconnectTimer() {
+  if (realtimeSocketState.reconnectTimer) {
+    clearTimeout(realtimeSocketState.reconnectTimer);
+    realtimeSocketState.reconnectTimer = null;
+  }
+}
+
+function closeRealtimeSocket() {
+  clearRealtimeReconnectTimer();
+  if (realtimeSocketState.socket) {
+    const socket = realtimeSocketState.socket;
+    realtimeSocketState.socket = null;
+    try {
+      socket.close();
+    } catch (_error) {
+      // ignore close failure
+    }
+  }
+  realtimeSocketState.status = "idle";
+  realtimeSocketState.subscribedByExchange.clear();
+}
+
+function resetRealtimeSession(sessionToken, deviceId) {
+  closeRealtimeSocket();
+  realtimeSocketState.sessionToken = clean(sessionToken);
+  realtimeSocketState.deviceId = clean(deviceId);
+  realtimeSocketState.desiredByExchange = new Map();
+  realtimeSocketState.subscribedByExchange = new Map();
+  realtimeSocketState.cache = new Map();
+  realtimeSocketState.connectedAt = "";
+  realtimeSocketState.lastMessageAt = "";
+  realtimeSocketState.messageCount = 0;
+  realtimeSocketState.lastError = "";
+}
+
+function realtimeCacheKey(exchange, symbol) {
+  return `${normalizeExchange(exchange)}|${upper(symbol)}`;
+}
+
+function realtimeCacheTimestampMs(snapshot) {
+  return Number(snapshot?.ts_ms || 0);
+}
+
+function isRealtimeSnapshotFresh(snapshot) {
+  const tsMs = realtimeCacheTimestampMs(snapshot);
+  return Number.isFinite(tsMs) && tsMs > 0 && (Date.now() - tsMs) <= REALTIME_STALE_MS;
+}
+
+function mergeRealtimeSnapshot(instrument, snapshot) {
+  const symbol = clean(instrument?.symbol || snapshot?.symbol);
+  if (!symbol || !snapshot || typeof snapshot !== "object") return;
+  const exchange = normalizeExchange(instrument?.exchange || snapshot?.exchange || "NSE");
+  const key = realtimeCacheKey(exchange, symbol);
+  const current = realtimeSocketState.cache.get(key) || {};
+  const merged = {
+    ...current,
+    ...snapshot,
+    symbol,
+    exchange,
+    ts_ms: Number(snapshot?.ts_ms || current?.ts_ms || Date.now()),
+    as_of: clean(snapshot?.as_of || current?.as_of || new Date().toISOString()),
+  };
+  realtimeSocketState.cache.set(key, merged);
+}
+
+function getRealtimeSnapshot(instrument) {
+  const symbol = clean(instrument?.symbol);
+  if (!symbol) return null;
+  const exchange = normalizeExchange(instrument?.exchange || "NSE");
+  const exact = realtimeSocketState.cache.get(realtimeCacheKey(exchange, symbol));
+  if (isRealtimeSnapshotFresh(exact)) {
+    return {
+      symbol,
+      ref_id: numberOrNull(instrument?.ref_id),
+      ltp: numberOrNull(exact?.ltp),
+      prev_close: numberOrNull(exact?.prev_close),
+      oi: numberOrNull(exact?.oi),
+      prev_oi: numberOrNull(exact?.prev_oi),
+      as_of: clean(exact?.as_of || new Date().toISOString()),
+      exchange,
+      source: "websocket:index",
+      ts_ms: realtimeCacheTimestampMs(exact),
+    };
+  }
+
+  for (const cached of realtimeSocketState.cache.values()) {
+    if (upper(cached?.symbol) !== upper(symbol)) continue;
+    if (!isRealtimeSnapshotFresh(cached)) continue;
+    return {
+      symbol,
+      ref_id: numberOrNull(instrument?.ref_id),
+      ltp: numberOrNull(cached?.ltp),
+      prev_close: numberOrNull(cached?.prev_close),
+      oi: numberOrNull(cached?.oi),
+      prev_oi: numberOrNull(cached?.prev_oi),
+      as_of: clean(cached?.as_of || new Date().toISOString()),
+      exchange: normalizeExchange(cached?.exchange || exchange),
+      source: "websocket:index",
+      ts_ms: realtimeCacheTimestampMs(cached),
+    };
+  }
+
+  return null;
+}
+
+function readVarint(buffer, offset) {
+  let value = 0;
+  let shift = 0;
+  let cursor = offset;
+  while (cursor < buffer.length) {
+    const byte = buffer[cursor];
+    value += (byte & 0x7f) * (2 ** shift);
+    cursor += 1;
+    if ((byte & 0x80) === 0) {
+      return { value, offset: cursor };
+    }
+    shift += 7;
+    if (shift > 56) {
+      throw new Error("Unsupported varint length");
+    }
+  }
+  throw new Error("Unexpected end of buffer while decoding varint");
+}
+
+function readLengthDelimited(buffer, offset) {
+  const header = readVarint(buffer, offset);
+  const length = Number(header.value);
+  const start = header.offset;
+  const end = start + length;
+  if (end > buffer.length) {
+    throw new Error("Invalid protobuf length-delimited field");
+  }
+  return {
+    value: buffer.subarray(start, end),
+    offset: end,
+  };
+}
+
+function readFloat32(buffer, offset) {
+  if (offset + 4 > buffer.length) {
+    throw new Error("Invalid protobuf fixed32 field");
+  }
+  const value = new DataView(buffer.buffer, buffer.byteOffset + offset, 4).getFloat32(0, true);
+  return { value, offset: offset + 4 };
+}
+
+function skipWireField(buffer, offset, wireType) {
+  if (wireType === 0) {
+    return readVarint(buffer, offset).offset;
+  }
+  if (wireType === 1) {
+    return offset + 8;
+  }
+  if (wireType === 2) {
+    return readLengthDelimited(buffer, offset).offset;
+  }
+  if (wireType === 5) {
+    return offset + 4;
+  }
+  throw new Error(`Unsupported protobuf wire type: ${wireType}`);
+}
+
+function decodeAnyEnvelope(buffer) {
+  const message = {
+    typeUrl: "",
+    value: new Uint8Array(0),
+  };
+  let offset = 0;
+  while (offset < buffer.length) {
+    const tag = readVarint(buffer, offset);
+    offset = tag.offset;
+    const fieldNumber = Math.floor(tag.value / 8);
+    const wireType = tag.value % 8;
+
+    if (fieldNumber === 1 && wireType === 2) {
+      const field = readLengthDelimited(buffer, offset);
+      message.typeUrl = textDecoder.decode(field.value);
+      offset = field.offset;
+      continue;
+    }
+
+    if (fieldNumber === 2 && wireType === 2) {
+      const field = readLengthDelimited(buffer, offset);
+      message.value = field.value;
+      offset = field.offset;
+      continue;
+    }
+
+    offset = skipWireField(buffer, offset, wireType);
+  }
+  return message;
+}
+
+function decodeGenericData(buffer) {
+  const envelope = decodeAnyEnvelope(buffer);
+  const innerAny = envelope.value?.length ? decodeAnyEnvelope(envelope.value) : { typeUrl: "", value: new Uint8Array(0) };
+  return {
+    key: envelope.typeUrl,
+    data: {
+      typeUrl: innerAny.typeUrl,
+      value: innerAny.value,
+    },
+  };
+}
+
+function decodeWebSocketMsgIndex(buffer) {
+  const message = {
+    indexname: "",
+    timestamp: null,
+    index_value: null,
+    high_index_value: null,
+    low_index_value: null,
+    volume: null,
+    changepercent: null,
+    tick_volume: null,
+    prev_close: null,
+    exchange: "",
+    volume_oi: null,
+  };
+  let offset = 0;
+  while (offset < buffer.length) {
+    const tag = readVarint(buffer, offset);
+    offset = tag.offset;
+    const fieldNumber = Math.floor(tag.value / 8);
+    const wireType = tag.value % 8;
+
+    if (fieldNumber === 1 && wireType === 2) {
+      const field = readLengthDelimited(buffer, offset);
+      message.indexname = textDecoder.decode(field.value);
+      offset = field.offset;
+      continue;
+    }
+    if (fieldNumber === 7 && wireType === 5) {
+      const field = readFloat32(buffer, offset);
+      message.changepercent = field.value;
+      offset = field.offset;
+      continue;
+    }
+    if (wireType === 0) {
+      const field = readVarint(buffer, offset);
+      offset = field.offset;
+      if (fieldNumber === 2) message.timestamp = field.value;
+      else if (fieldNumber === 3) message.index_value = field.value;
+      else if (fieldNumber === 4) message.high_index_value = field.value;
+      else if (fieldNumber === 5) message.low_index_value = field.value;
+      else if (fieldNumber === 6) message.volume = field.value;
+      else if (fieldNumber === 8) message.tick_volume = field.value;
+      else if (fieldNumber === 9) message.prev_close = field.value;
+      else if (fieldNumber === 11) message.volume_oi = field.value;
+      continue;
+    }
+    if (fieldNumber === 10 && wireType === 2) {
+      const field = readLengthDelimited(buffer, offset);
+      message.exchange = textDecoder.decode(field.value);
+      offset = field.offset;
+      continue;
+    }
+    offset = skipWireField(buffer, offset, wireType);
+  }
+  return message;
+}
+
+function decodeBatchWebSocketIndexMessage(buffer) {
+  const message = {
+    timestamp: null,
+    indexes: [],
+    instruments: [],
+  };
+  let offset = 0;
+  while (offset < buffer.length) {
+    const tag = readVarint(buffer, offset);
+    offset = tag.offset;
+    const fieldNumber = Math.floor(tag.value / 8);
+    const wireType = tag.value % 8;
+    if (fieldNumber === 1 && wireType === 0) {
+      const field = readVarint(buffer, offset);
+      message.timestamp = field.value;
+      offset = field.offset;
+      continue;
+    }
+    if ((fieldNumber === 2 || fieldNumber === 3) && wireType === 2) {
+      const field = readLengthDelimited(buffer, offset);
+      const entry = decodeWebSocketMsgIndex(field.value);
+      if (fieldNumber === 2) message.indexes.push(entry);
+      else message.instruments.push(entry);
+      offset = field.offset;
+      continue;
+    }
+    offset = skipWireField(buffer, offset, wireType);
+  }
+  return message;
+}
+
+async function coerceRealtimeMessageData(data) {
+  if (typeof data === "string") {
+    return { kind: "text", value: data };
+  }
+  if (data instanceof ArrayBuffer) {
+    return { kind: "binary", value: new Uint8Array(data) };
+  }
+  if (ArrayBuffer.isView(data)) {
+    return { kind: "binary", value: new Uint8Array(data.buffer, data.byteOffset, data.byteLength) };
+  }
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    return { kind: "binary", value: new Uint8Array(await data.arrayBuffer()) };
+  }
+  return { kind: "unknown", value: data };
+}
+
+function upsertRealtimeIndexEntry(entry) {
+  const symbol = clean(entry?.indexname);
+  if (!symbol) return;
+  const exchange = normalizeExchange(entry?.exchange || "NSE");
+  const snapshot = {
+    symbol,
+    exchange,
+    ltp: numberOrNull(entry?.index_value),
+    prev_close: numberOrNull(entry?.prev_close),
+    oi: numberOrNull(entry?.volume_oi),
+    prev_oi: null,
+    as_of: timestampToIso(entry?.timestamp) || new Date().toISOString(),
+    ts_ms: Number(tsToMs(entry?.timestamp) || Date.now()),
+    source: "websocket:index",
+  };
+  mergeRealtimeSnapshot({ symbol, exchange }, snapshot);
+}
+
+function isIndexMessageType(typeUrl) {
+  const probe = lowerCaseString(typeUrl);
+  return probe.endsWith("batchwebsocketindexmessage") || probe.includes("batchwebsocketindexmessage");
+}
+
+function extractIndexMessagePayload(buffer) {
+  const candidates = [];
+
+  try {
+    const outer = decodeAnyEnvelope(buffer);
+    if (outer.typeUrl || outer.value.length) {
+      candidates.push(outer);
+      if (outer.value.length) {
+        try {
+          const inner = decodeAnyEnvelope(outer.value);
+          if (inner.typeUrl || inner.value.length) {
+            candidates.push(inner);
+          }
+        } catch (_error) {
+          // fall back below
+        }
+      }
+    }
+  } catch (_error) {
+    // fall back below
+  }
+
+  try {
+    const generic = decodeGenericData(buffer);
+    if (generic?.data?.typeUrl || generic?.data?.value?.length) {
+      candidates.push({
+        typeUrl: generic.data.typeUrl,
+        value: generic.data.value,
+        key: generic.key,
+      });
+    }
+  } catch (_error) {
+    // ignore and try raw decode
+  }
+
+  for (const candidate of candidates) {
+    if (isIndexMessageType(candidate?.typeUrl)) {
+      return candidate.value;
+    }
+  }
+
+  return buffer;
+}
+
+function handleRealtimeBinaryMessage(buffer) {
+  const payload = extractIndexMessagePayload(buffer);
+  const message = decodeBatchWebSocketIndexMessage(payload);
+  if (!message.indexes.length && !message.instruments.length) {
+    return;
+  }
+  for (const entry of message.indexes || []) upsertRealtimeIndexEntry(entry);
+  for (const entry of message.instruments || []) upsertRealtimeIndexEntry(entry);
+}
+
+function lowerCaseString(value) {
+  return clean(value).toLowerCase();
+}
+
+async function handleRealtimeSocketMessage(event) {
+  realtimeSocketState.lastMessageAt = new Date().toISOString();
+  realtimeSocketState.messageCount += 1;
+  const payload = await coerceRealtimeMessageData(event?.data);
+  if (payload.kind === "text") {
+    const text = clean(payload.value);
+    if (text && /error|invalid|unauthor/i.test(text)) {
+      realtimeSocketState.lastError = text;
+    }
+    return;
+  }
+  if (payload.kind === "binary") {
+    handleRealtimeBinaryMessage(payload.value);
+  }
+}
+
+function sendRealtimeIndexSubscribe(exchange, symbols) {
+  const socket = realtimeSocketState.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const list = Array.from(new Set((symbols || []).map((symbol) => upper(symbol)).filter(Boolean)));
+  if (!list.length) return;
+  const payload = JSON.stringify({ indexes: list });
+  socket.send(`batch_subscribe ${realtimeSocketState.sessionToken} index ${payload} ${normalizeExchange(exchange)}`);
+  const subscribed = ensureMapSet(realtimeSocketState.subscribedByExchange, exchange);
+  for (const symbol of list) {
+    subscribed.add(upper(symbol));
+  }
+}
+
+function resubscribeRealtimeSymbols() {
+  if (!realtimeSocketState.socket || realtimeSocketState.socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  realtimeSocketState.subscribedByExchange = new Map();
+  if (INDEX_SOCKET_INTERVAL) {
+    realtimeSocketState.socket.send(
+      `batch_subscribe ${realtimeSocketState.sessionToken} socket_interval index ${INDEX_SOCKET_INTERVAL}`
+    );
+  }
+  for (const [exchange, symbols] of realtimeSocketState.desiredByExchange.entries()) {
+    sendRealtimeIndexSubscribe(exchange, Array.from(symbols));
+  }
+}
+
+function scheduleRealtimeReconnect() {
+  clearRealtimeReconnectTimer();
+  if (!realtimeSocketState.sessionToken || !desiredRealtimeSymbolCount()) {
+    realtimeSocketState.status = "idle";
+    return;
+  }
+  realtimeSocketState.status = "reconnecting";
+  realtimeSocketState.reconnectTimer = setTimeout(() => {
+    realtimeSocketState.reconnectTimer = null;
+    ensureRealtimeSocket();
+  }, REALTIME_RECONNECT_MS);
+}
+
+function ensureRealtimeSocket() {
+  if (!realtimeSocketState.sessionToken || !desiredRealtimeSymbolCount()) {
+    return;
+  }
+  if (typeof WebSocket === "undefined") {
+    realtimeSocketState.lastError = "WebSocket is unavailable in this Node runtime";
+    return;
+  }
+  const socket = realtimeSocketState.socket;
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  clearRealtimeReconnectTimer();
+  realtimeSocketState.status = "connecting";
+  const nextSocket = new WebSocket(websocketOrigin());
+  realtimeSocketState.socket = nextSocket;
+
+  nextSocket.addEventListener("open", () => {
+    realtimeSocketState.status = "open";
+    realtimeSocketState.connectedAt = new Date().toISOString();
+    realtimeSocketState.lastError = "";
+    resubscribeRealtimeSymbols();
+  });
+
+  nextSocket.addEventListener("message", (event) => {
+    handleRealtimeSocketMessage(event).catch((error) => {
+      realtimeSocketState.lastError = clean(error?.message || error);
+    });
+  });
+
+  nextSocket.addEventListener("error", (error) => {
+    realtimeSocketState.lastError = clean(error?.message || "WebSocket error");
+  });
+
+  nextSocket.addEventListener("close", () => {
+    if (realtimeSocketState.socket === nextSocket) {
+      realtimeSocketState.socket = null;
+    }
+    realtimeSocketState.status = "closed";
+    realtimeSocketState.subscribedByExchange = new Map();
+    scheduleRealtimeReconnect();
+  });
+}
+
+function ensureRealtimeSymbolsSubscribed(sessionToken, deviceId, subscriptions) {
+  const safeToken = clean(sessionToken);
+  if (!safeToken) return;
+  if (realtimeSocketState.sessionToken !== safeToken || realtimeSocketState.deviceId !== clean(deviceId)) {
+    resetRealtimeSession(safeToken, deviceId);
+  }
+
+  const additions = new Map();
+  for (const entry of Array.isArray(subscriptions) ? subscriptions : []) {
+    const symbol = clean(entry?.symbol);
+    if (!symbol) continue;
+    const exchange = normalizeExchange(entry?.exchange || "NSE");
+    const desired = ensureMapSet(realtimeSocketState.desiredByExchange, exchange);
+    const probe = upper(symbol);
+    if (!desired.has(probe)) {
+      desired.add(probe);
+      ensureMapSet(additions, exchange).add(probe);
+    }
+  }
+
+  ensureRealtimeSocket();
+  if (!realtimeSocketState.socket || realtimeSocketState.socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  for (const [exchange, symbols] of additions.entries()) {
+    sendRealtimeIndexSubscribe(exchange, Array.from(symbols));
+  }
+}
+
+function instrumentRealtimeSubscription(instrument, fallbackExchange) {
+  const symbol = clean(instrument?.symbol);
+  if (!symbol) return null;
+  return {
+    symbol,
+    exchange: normalizeExchange(instrument?.exchange || fallbackExchange || "NSE"),
+  };
+}
+
+function itemRealtimeSubscriptions(item) {
+  const subscriptions = [];
+  const stock = instrumentRealtimeSubscription(item?.stock, "NSE");
+  if (stock) subscriptions.push(stock);
+  for (const future of Array.isArray(item?.futures) ? item.futures : []) {
+    const entry = instrumentRealtimeSubscription(future, future?.exchange || "NFO");
+    if (entry) subscriptions.push(entry);
+  }
+  return subscriptions;
+}
+
 function snapshotFromBook(raw, fallbackSymbol) {
   const book = raw?.orderBook || raw || {};
   return {
@@ -557,12 +1146,18 @@ function snapshotFromBook(raw, fallbackSymbol) {
     oi: numberOrNull(book?.oi ?? book?.open_interest ?? book?.openInterest ?? book?.volume_oi ?? book?.volumeOi),
     prev_oi: numberOrNull(book?.prev_oi ?? book?.previous_open_interest ?? book?.previousOpenInterest),
     as_of: timestampToIso(book?.ts ?? book?.timestamp ?? raw?.ts ?? raw?.timestamp) || new Date().toISOString(),
+    source: "orderbook",
   };
 }
 
 async function fetchMarketSnapshot(sessionToken, deviceId, instrument) {
   const refId = Number(instrument?.ref_id);
   const symbol = clean(instrument?.symbol);
+  const liveSnapshot = getRealtimeSnapshot(instrument);
+  if (liveSnapshot && liveSnapshot.oi !== null && liveSnapshot.ltp !== null) {
+    return liveSnapshot;
+  }
+  let fallbackSnapshot = null;
   if (Number.isInteger(refId) && refId > 0) {
     try {
       const upstream = await proxyRequest(`/orderbooks/${encodeURIComponent(String(refId))}?levels=1`, {
@@ -573,14 +1168,14 @@ async function fetchMarketSnapshot(sessionToken, deviceId, instrument) {
         },
       });
       if (upstream.statusCode >= 200 && upstream.statusCode < 300) {
-        return snapshotFromBook(upstream.data, symbol);
+        fallbackSnapshot = snapshotFromBook(upstream.data, symbol);
       }
     } catch (_error) {
       // fallback below
     }
   }
 
-  if (symbol) {
+  if (!fallbackSnapshot && symbol) {
     try {
       const upstream = await proxyRequest(`/optionchains/${encodeURIComponent(symbol)}/price`, {
         method: "GET",
@@ -590,7 +1185,7 @@ async function fetchMarketSnapshot(sessionToken, deviceId, instrument) {
         },
       });
       if (upstream.statusCode >= 200 && upstream.statusCode < 300) {
-        return {
+        fallbackSnapshot = {
           symbol,
           ref_id: Number.isInteger(refId) && refId > 0 ? refId : null,
           ltp: numberOrNull(upstream.data?.price ?? upstream.data?.ltp),
@@ -598,11 +1193,31 @@ async function fetchMarketSnapshot(sessionToken, deviceId, instrument) {
           oi: numberOrNull(upstream.data?.oi ?? upstream.data?.open_interest ?? upstream.data?.volume_oi),
           prev_oi: numberOrNull(upstream.data?.prev_oi ?? upstream.data?.previous_open_interest),
           as_of: new Date().toISOString(),
+          source: "symbol_price",
         };
       }
     } catch (_error) {
       // ignore
     }
+  }
+
+  if (fallbackSnapshot && liveSnapshot) {
+    const merged = {
+      ...fallbackSnapshot,
+      ...liveSnapshot,
+      prev_oi: liveSnapshot?.prev_oi ?? fallbackSnapshot?.prev_oi ?? null,
+      prev_close: liveSnapshot?.prev_close ?? fallbackSnapshot?.prev_close ?? null,
+      ref_id: fallbackSnapshot?.ref_id ?? liveSnapshot?.ref_id ?? null,
+      symbol: symbol || liveSnapshot?.symbol || fallbackSnapshot?.symbol || "",
+    };
+    mergeRealtimeSnapshot(instrument, merged);
+    return merged;
+  }
+  if (liveSnapshot) {
+    return liveSnapshot;
+  }
+  if (fallbackSnapshot) {
+    return fallbackSnapshot;
   }
 
   return {
@@ -613,6 +1228,7 @@ async function fetchMarketSnapshot(sessionToken, deviceId, instrument) {
     oi: null,
     prev_oi: null,
     as_of: new Date().toISOString(),
+    source: "",
   };
 }
 
@@ -710,11 +1326,14 @@ function mapByUnderlying(rows) {
   return out;
 }
 
-async function fetchUnderlyingOverview(sessionToken, deviceId, payload) {
+async function fetchUnderlyingOverview(sessionToken, deviceId, payload, options = {}) {
   const underlying = upper(payload?.underlying);
   const cached = findFutureStock(underlying);
   if (!cached) {
     throw new Error("underlying not found in futures cache");
+  }
+  if (options?.subscribeRealtime !== false) {
+    ensureRealtimeSymbolsSubscribed(sessionToken, deviceId, itemRealtimeSubscriptions(cached));
   }
 
   const stockSnapshot = await fetchMarketSnapshot(sessionToken, deviceId, cached.stock);
@@ -734,6 +1353,7 @@ async function fetchUnderlyingOverview(sessionToken, deviceId, payload) {
       prev_close: stockSnapshot?.prev_close ?? null,
       curr_ltp: stockSnapshot?.ltp ?? null,
       ltp_as_of: stockSnapshot?.as_of || "",
+      quote_source: stockSnapshot?.source || "",
     },
     current_future: currentFuture ? {
       symbol: currentFuture.symbol,
@@ -745,6 +1365,7 @@ async function fetchUnderlyingOverview(sessionToken, deviceId, payload) {
       oi_yest_close: currentFutureSnapshot?.prev_oi ?? null,
       oi_current: currentFutureSnapshot?.oi ?? null,
       oi_as_of: currentFutureSnapshot?.as_of || "",
+      quote_source: currentFutureSnapshot?.source || "",
     } : null,
     next_future: nextFuture ? {
       symbol: nextFuture.symbol,
@@ -756,6 +1377,7 @@ async function fetchUnderlyingOverview(sessionToken, deviceId, payload) {
       oi_yest_close: nextFutureSnapshot?.prev_oi ?? null,
       oi_current: nextFutureSnapshot?.oi ?? null,
       oi_as_of: nextFutureSnapshot?.as_of || "",
+      quote_source: nextFutureSnapshot?.source || "",
     } : null,
     third_future: thirdFuture ? {
       symbol: thirdFuture.symbol,
@@ -767,6 +1389,7 @@ async function fetchUnderlyingOverview(sessionToken, deviceId, payload) {
       oi_yest_close: thirdFutureSnapshot?.prev_oi ?? null,
       oi_current: thirdFutureSnapshot?.oi ?? null,
       oi_as_of: thirdFutureSnapshot?.as_of || "",
+      quote_source: thirdFutureSnapshot?.source || "",
     } : null,
     updated_at: new Date().toISOString(),
   };
@@ -776,7 +1399,7 @@ async function captureIntervalUniverse(sessionToken, deviceId) {
   const items = Array.isArray(futureStockCache.items) ? futureStockCache.items : [];
   const snapshots = await mapWithConcurrency(items, 6, async (item) => {
     try {
-      return await fetchUnderlyingOverview(sessionToken, deviceId, { underlying: item.underlying });
+      return await fetchUnderlyingOverview(sessionToken, deviceId, { underlying: item.underlying }, { subscribeRealtime: false });
     } catch (error) {
       return {
         underlying: item.underlying,
@@ -948,7 +1571,7 @@ async function buildIntervalUniverse(sessionToken, deviceId, payload) {
 
   const nowMinutes = currentIstMinutes();
   const latestIntervalIndex = intervals.findIndex((interval) => nowMinutes >= Number(interval.start) && nowMinutes < Number(interval.end));
-  const completedIntervals = intervals.filter((interval) => interval.index !== latestIntervalIndex);
+  const completedIntervals = intervals.filter((interval) => Number(interval.end) <= nowMinutes);
 
   const earliestStart = Math.min(...intervals.map((interval) => Number(interval.start)));
   const latestCompletedEnd = completedIntervals.length
@@ -1001,6 +1624,9 @@ async function buildIntervalUniverse(sessionToken, deviceId, payload) {
         if (live) snapshotsByInterval[key][item.underlying] = live;
         continue;
       }
+      if (Number(interval.end) > nowMinutes) {
+        continue;
+      }
       const stockData = intervalSeriesValue(stockSeries.get(upper(item.stock?.symbol || "")), intervalEndMs);
       const futureLookupKey = futureSeriesResolvedSymbols.has(upper(item.futures?.[0]?.symbol || ""))
         ? upper(item.futures?.[0]?.symbol || "")
@@ -1051,11 +1677,12 @@ async function buildIntervalUniverse(sessionToken, deviceId, payload) {
 async function fetchTrackerQuote(sessionToken, deviceId, payload) {
   const refId = Number(payload?.ref_id);
   const symbol = clean(payload?.symbol);
-  let ltp = "";
-  let oi = "";
-  let source = "";
+  const liveSnapshot = getRealtimeSnapshot(payload);
+  let ltp = numberOrBlank(liveSnapshot?.ltp);
+  let oi = numberOrBlank(liveSnapshot?.oi);
+  let source = ltp !== "" || oi !== "" ? "websocket_index" : "";
 
-  if (Number.isInteger(refId) && refId > 0) {
+  if ((ltp === "" || oi === "") && Number.isInteger(refId) && refId > 0) {
     try {
       const upstream = await proxyRequest(`/orderbooks/${encodeURIComponent(String(refId))}?levels=1`, {
         method: "GET",
@@ -1067,22 +1694,24 @@ async function fetchTrackerQuote(sessionToken, deviceId, payload) {
 
       if (upstream.statusCode >= 200 && upstream.statusCode < 300) {
         const book = upstream.data?.orderBook || upstream.data || {};
-        ltp = numberOrBlank(book?.ltp ?? book?.last_traded_price ?? book?.price);
-        oi = numberOrBlank(
-          book?.oi
-          ?? book?.open_interest
-          ?? book?.openInterest
-          ?? book?.volume_oi
-          ?? book?.volumeOi
-        );
-        source = "orderbook";
+        if (ltp === "") ltp = numberOrBlank(book?.ltp ?? book?.last_traded_price ?? book?.price);
+        if (oi === "") {
+          oi = numberOrBlank(
+            book?.oi
+            ?? book?.open_interest
+            ?? book?.openInterest
+            ?? book?.volume_oi
+            ?? book?.volumeOi
+          );
+        }
+        source = source || "orderbook";
       }
     } catch (_error) {
       // fall through to symbol price
     }
   }
 
-  if (ltp === "" && symbol) {
+  if ((ltp === "" || oi === "") && symbol) {
     try {
       const upstream = await proxyRequest(`/optionchains/${encodeURIComponent(symbol)}/price`, {
         method: "GET",
@@ -1093,7 +1722,7 @@ async function fetchTrackerQuote(sessionToken, deviceId, payload) {
       });
 
       if (upstream.statusCode >= 200 && upstream.statusCode < 300) {
-        ltp = numberOrBlank(upstream.data?.price ?? upstream.data?.ltp);
+        if (ltp === "") ltp = numberOrBlank(upstream.data?.price ?? upstream.data?.ltp);
         oi = oi === "" ? numberOrBlank(
           upstream.data?.oi
           ?? upstream.data?.open_interest
@@ -1209,6 +1838,24 @@ async function routeLocalApi(req, res, urlObj) {
       count: futureStockCache.items.length || 0,
       cached: Array.isArray(futureStockCache.items) && futureStockCache.items.length > 0,
       items: futureStockCache.items,
+    });
+    return true;
+  }
+
+  if (pathname === "/api/realtime/status" && method === "GET") {
+    writeJson(res, 200, {
+      url: websocketOrigin(),
+      status: realtimeSocketState.status,
+      connected_at: realtimeSocketState.connectedAt || "",
+      last_message_at: realtimeSocketState.lastMessageAt || "",
+      message_count: realtimeSocketState.messageCount || 0,
+      last_error: realtimeSocketState.lastError || "",
+      desired_symbol_count: desiredRealtimeSymbolCount(),
+      subscriptions: Array.from(realtimeSocketState.desiredByExchange.entries()).map(([exchange, symbols]) => ({
+        exchange,
+        count: symbols.size,
+        symbols: Array.from(symbols),
+      })),
     });
     return true;
   }
